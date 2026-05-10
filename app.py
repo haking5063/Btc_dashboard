@@ -41,12 +41,32 @@ def fetch_klines_fallback(symbol, interval="1h", limit=100):
     df = fetch_klines(symbol, interval, limit)
     if not df.empty and "close" in df.columns:
         return df
+
     try:
         coin_id = COINGECKO_IDS.get(symbol, "bitcoin")
-        r = requests.get(f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart", params={"vs_currency": "usd", "days": "4", "interval": "hourly"}, timeout=15)
+        r = requests.get(
+            f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart",
+            params={"vs_currency": "usd", "days": "4", "interval": "hourly"},
+            timeout=15
+        )
         r.raise_for_status()
         mc = r.json()
+
         prices = pd.DataFrame(mc.get("prices", []), columns=["ts", "close"])
         volumes = pd.DataFrame(mc.get("total_volumes", []), columns=["ts", "volume"])
+
         if prices.empty or volumes.empty:
-            retur
+            return pd.DataFrame()
+
+        df2 = prices.merge(volumes, on="ts")
+        df2["time"] = pd.to_datetime(df2["ts"], unit="ms")
+        df2 = df2.tail(limit).reset_index(drop=True)
+        df2["close"] = df2["close"].astype(float)
+        df2["volume"] = df2["volume"].astype(float)
+        df2["open"] = df2["close"].shift(1).fillna(df2["close"])
+        df2["high"] = df2[["open", "close"]].max(axis=1) * (1 + np.random.uniform(0, 0.003, len(df2)))
+        df2["low"] = df2[["open", "close"]].min(axis=1) * (1 - np.random.uniform(0, 0.003, len(df2)))
+        return df2[["time", "open", "high", "low", "close", "volume"]]
+
+    except Exception:
+        return pd.DataFrame()
