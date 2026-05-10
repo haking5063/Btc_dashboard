@@ -11,6 +11,7 @@ BINANCE_FAPI = "https://fapi.binance.com"
 BINANCE_DAPI = "https://fapi.binance.com/futures/data"
 
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
+
 COINGECKO_IDS = {
     "BTCUSDT": "bitcoin",
     "ETHUSDT": "ethereum",
