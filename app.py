@@ -7,8 +7,10 @@ from plotly.subplots import make_subplots
 
 st.set_page_config(page_title="BTC 15x Dashboard", layout="wide")
 
+BINANCE_BASE = "https://fapi.binance.com"
+
 @st.cache_data(ttl=300)
-def fetch_market_data():
+def fetch_price_data():
     r = requests.get(
         "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart",
         params={"vs_currency": "usd", "days": "4", "interval": "hourly"},
@@ -16,29 +18,78 @@ def fetch_market_data():
     )
     r.raise_for_status()
     mc = r.json()
+
     prices = pd.DataFrame(mc["prices"], columns=["ts", "close"])
     volumes = pd.DataFrame(mc["total_volumes"], columns=["ts", "volume"])
     df = prices.merge(volumes, on="ts")
     df["time"] = pd.to_datetime(df["ts"], unit="ms")
     df = df.tail(72).reset_index(drop=True)
+
     df["open"] = df["close"].shift(1).fillna(df["close"])
     df["high"] = df[["open", "close"]].max(axis=1) * (1 + np.random.uniform(0, 0.003, len(df)))
     df["low"] = df[["open", "close"]].min(axis=1) * (1 - np.random.uniform(0, 0.003, len(df)))
     return df
 
+@st.cache_data(ttl=900)
+def fetch_funding_rate():
+    r = requests.get(
+        f"{BINANCE_BASE}/fapi/v1/fundingRate",
+        params={"symbol": "BTCUSDT", "limit": 10},
+        timeout=15
+    )
+    r.raise_for_status()
+    data = r.json()
+    if not 
+        return pd.DataFrame(columns=["time", "fundingRate"])
+    fr = pd.DataFrame(data)
+    fr["time"] = pd.to_datetime(fr["fundingTime"], unit="ms")
+    fr["fundingRate"] = fr["fundingRate"].astype(float) * 100
+    return fr[["time", "fundingRate"]]
+
+@st.cache_data(ttl=900)
+def fetch_open_interest():
+    r = requests.get(
+        f"{BINANCE_BASE}/futures/data/openInterestHist",
+        params={"symbol": "BTCUSDT", "period": "1h", "limit": 30},
+        timeout=15
+    )
+    r.raise_for_status()
+    data = r.json()
+    if not 
+        return pd.DataFrame(columns=["time", "oi"])
+    oi = pd.DataFrame(data)
+    oi["time"] = pd.to_datetime(oi["timestamp"], unit="ms")
+    oi["oi"] = oi["sumOpenInterestValue"].astype(float)
+    return oi[["time", "oi"]]
+
+@st.cache_data(ttl=1800)
+def fetch_fear_greed():
+    try:
+        r = requests.get("https://api.alternative.me/fng/?limit=1&format=json", timeout=15)
+        r.raise_for_status()
+        j = r.json()
+        v = int(j["data"][0]["value"])
+        c = j["data"][0]["value_classification"]
+        return v, c
+    except Exception:
+        return None, "N/A"
+
 def add_indicators(df):
     df = df.copy()
     df["ema20"] = df["close"].ewm(span=20).mean()
     df["ema50"] = df["close"].ewm(span=50).mean()
+
     delta = df["close"].diff()
     gain = delta.clip(lower=0).ewm(alpha=1/14).mean()
     loss = (-delta.clip(upper=0)).ewm(alpha=1/14).mean()
     df["rsi"] = 100 - 100 / (1 + gain / loss)
+
     ema12 = df["close"].ewm(span=12).mean()
     ema26 = df["close"].ewm(span=26).mean()
     df["macd"] = ema12 - ema26
     df["macd_signal"] = df["macd"].ewm(span=9).mean()
     df["macd_hist"] = df["macd"] - df["macd_signal"]
+
     bb_mid = df["close"].rolling(20).mean()
     bb_std = df["close"].rolling(20).std()
     df["bb_mid"] = bb_mid
@@ -60,7 +111,7 @@ def find_levels(df):
     sup_lvls = sorted(set(sup_lvls))[:3]
     return sup_lvls, res_lvls
 
-def get_signal(df, sup_lvls, res_lvls):
+def get_signal(df, sup_lvls, res_lvls, fr_df, oi_df, fng_value):
     cp = df["close"].iloc[-1]
     rsi = df["rsi"].iloc[-1]
     macd = df["macd"].iloc[-1]
@@ -73,54 +124,122 @@ def get_signal(df, sup_lvls, res_lvls):
     ls, ss = 0, 0
     lr, sr = [], []
 
-    if rsi < 40: ls += 2; lr.append(f"RSI 과매도 ({rsi:.1f})")
-    elif rsi > 60: ss += 2; sr.append(f"RSI 과매수 ({rsi:.1f})")
+    if rsi < 40:
+        ls += 2; lr.append(f"RSI 과매도 ({rsi:.1f})")
+    elif rsi > 60:
+        ss += 2; sr.append(f"RSI 과매수 ({rsi:.1f})")
 
-    if macd > macd_sig: ls += 1; lr.append("MACD 상향")
-    else: ss += 1; sr.append("MACD 하향")
+    if macd > macd_sig:
+        ls += 1; lr.append("MACD 상향")
+    else:
+        ss += 1; sr.append("MACD 하향")
 
-    if cp < bb_low * 1.005: ls += 2; lr.append("BB 하단 근접")
-    elif cp > bb_high * 0.995: ss += 2; sr.append("BB 상단 근접")
+    if cp < bb_low * 1.005:
+        ls += 2; lr.append("BB 하단 근접")
+    elif cp > bb_high * 0.995:
+        ss += 2; sr.append("BB 상단 근접")
 
-    if ema20 > ema50: ls += 1; lr.append("EMA20 > EMA50")
-    else: ss += 1; sr.append("EMA20 < EMA50")
+    if ema20 > ema50:
+        ls += 1; lr.append("EMA20 > EMA50")
+    else:
+        ss += 1; sr.append("EMA20 < EMA50")
 
-    if sup_lvls and cp < min(sup_lvls) * 1.012: ls += 2; lr.append("지지선 근처")
-    if res_lvls and cp > max(res_lvls) * 0.988: ss += 2; sr.append("저항선 근처")
+    if sup_lvls and cp < min(sup_lvls) * 1.012:
+        ls += 2; lr.append("지지선 근처")
+    if res_lvls and cp > max(res_lvls) * 0.988:
+        ss += 2; sr.append("저항선 근처")
+
+    funding_now = None
+    funding_avg = None
+    funding_signal = "N/A"
+    if not fr_df.empty:
+        funding_now = fr_df["fundingRate"].iloc[-1]
+        funding_avg = fr_df["fundingRate"].tail(5).mean()
+        if funding_now > 0.01:
+            ss += 2; sr.append(f"펀딩비 과열 +{funding_now:.4f}%")
+            funding_signal = "롱 과열"
+        elif funding_now < -0.01:
+            ls += 2; lr.append(f"펀딩비 과냉 {funding_now:.4f}%")
+            funding_signal = "숏 과열"
+
+    oi_now = None
+    oi_chg = None
+    oi_signal = "N/A"
+    if not oi_df.empty and len(oi_df) >= 2:
+        oi_now = oi_df["oi"].iloc[-1]
+        oi_prev = oi_df["oi"].iloc[-2]
+        oi_chg = (oi_now - oi_prev) / oi_prev * 100 if oi_prev else 0
+        if oi_chg > 0.5 and cp > df["close"].iloc[-2]:
+            ls += 1; lr.append(f"OI 증가 +{oi_chg:.2f}%")
+            oi_signal = "상승 동반 OI 증가"
+        elif oi_chg > 0.5 and cp < df["close"].iloc[-2]:
+            ss += 1; sr.append(f"OI 증가 +{oi_chg:.2f}%")
+            oi_signal = "하락 동반 OI 증가"
+
+    if fng_value is not None:
+        if fng_value <= 25:
+            ls += 2; lr.append(f"공포탐욕 극단 공포 ({fng_value})")
+        elif fng_value >= 75:
+            ss += 2; sr.append(f"공포탐욕 극단 탐욕 ({fng_value})")
 
     liq_long = cp * (1 - 1/15.5)
     liq_short = cp * (1 + 1/14.5)
 
-    if ls > ss: sig = "🟢 롱 우세"
-    elif ss > ls: sig = "🔴 숏 우세"
-    else: sig = "⚪ 중립"
+    if ls > ss:
+        sig = "🟢 롱 우세"
+    elif ss > ls:
+        sig = "🔴 숏 우세"
+    else:
+        sig = "⚪ 중립"
 
-    return {"cp": cp, "rsi": rsi, "ls": ls, "ss": ss,
-            "lr": lr, "sr": sr, "liq_long": liq_long,
-            "liq_short": liq_short, "signal": sig}
+    return {
+        "cp": cp, "rsi": rsi, "ls": ls, "ss": ss,
+        "lr": lr, "sr": sr, "liq_long": liq_long,
+        "liq_short": liq_short, "signal": sig,
+        "funding_now": funding_now, "funding_avg": funding_avg,
+        "funding_signal": funding_signal,
+        "oi_now": oi_now, "oi_chg": oi_chg, "oi_signal": oi_signal,
+        "fng_value": fng_value
+    }
 
-# ── Main ──────────────────────────────────────────────────────────
+def calc_tpsl(entry, side, lev, sl_pct, tp_pct):
+    if side == "LONG":
+        sl = entry * (1 - sl_pct / 100)
+        tp = entry * (1 + tp_pct / 100)
+    else:
+        sl = entry * (1 + sl_pct / 100)
+        tp = entry * (1 - tp_pct / 100)
+    liq = entry * (1 - 1 / lev) if side == "LONG" else entry * (1 + 1 / lev)
+    return sl, tp, liq
+
 st.title("🚀 BTC 15x 레버리지 대시보드")
-st.caption("1H 기준 | CoinGecko 데이터 | 5분마다 자동 갱신")
+st.caption("1H 기준 | CoinGecko + Binance 공개 API | 5분마다 자동 갱신")
 
 if st.button("🔄 새로고침"):
     st.cache_data.clear()
+    st.rerun()
 
 try:
-    df = add_indicators(fetch_market_data())
+    df = add_indicators(fetch_price_data())
+    fr_df = fetch_funding_rate()
+    oi_df = fetch_open_interest()
+    fng_value, fng_class = fetch_fear_greed()
     sup_lvls, res_lvls = find_levels(df)
-    sig = get_signal(df, sup_lvls, res_lvls)
+    sig = get_signal(df, sup_lvls, res_lvls, fr_df, oi_df, fng_value)
 
-    # ── 상단 지표 카드 ──
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("현재가", f"${sig['cp']:,.0f}")
     c2.metric("RSI", f"{sig['rsi']:.1f}", delta="과매도" if sig['rsi'] < 40 else ("과매수" if sig['rsi'] > 60 else "중립"))
-    c3.metric("🔴 15x 롱 청산가", f"${sig['liq_long']:,.0f}", delta=f"-{(sig['cp']-sig['liq_long'])/sig['cp']*100:.1f}%")
-    c4.metric("🟢 15x 숏 청산가", f"${sig['liq_short']:,.0f}", delta=f"+{(sig['liq_short']-sig['cp'])/sig['cp']*100:.1f}%")
+    c3.metric("15x 롱 청산가", f"${sig['liq_long']:,.0f}")
+    c4.metric("15x 숏 청산가", f"${sig['liq_short']:,.0f}")
+    c5.metric("공포탐욕", f"{fng_value if fng_value is not None else 'N/A'}")
 
-    # ── 시그널 박스 ──
-    sig_color = "green" if sig['ls'] > sig['ss'] else ("red" if sig['ss'] > sig['ls'] else "orange")
-    st.markdown(f"<h2 style='text-align:center;color:{sig_color}'>{sig['signal']} &nbsp; 롱 {sig['ls']}/8 &nbsp;|&nbsp; 숏 {sig['ss']}/8</h2>", unsafe_allow_html=True)
+    sig_color = "green" if sig["ls"] > sig["ss"] else ("red" if sig["ss"] > sig["ls"] else "orange")
+    st.markdown(
+        f"<h2 style='text-align:center;color:{sig_color}'>{sig['signal']} &nbsp; "
+        f"롱 {sig['ls']}/15 &nbsp;|&nbsp; 숏 {sig['ss']}/15</h2>",
+        unsafe_allow_html=True
+    )
 
     col_l, col_r = st.columns([3, 1])
 
@@ -172,7 +291,7 @@ try:
             marker_color=vol_colors, showlegend=False), row=4, col=1)
 
         fig.update_layout(
-            height=800, paper_bgcolor="#0d1117", plot_bgcolor="#0d1117",
+            height=900, paper_bgcolor="#0d1117", plot_bgcolor="#0d1117",
             font=dict(color="#e6edf3"), xaxis_rangeslider_visible=False,
             margin=dict(l=10, r=10, t=20, b=10), legend_orientation="h"
         )
@@ -196,6 +315,15 @@ try:
             st.write(f"❌ {r}")
 
         st.divider()
+        st.subheader("📌 펀딩비 / OI")
+        st.write(f"현재 펀딩비: {sig['funding_now']:.4f}%" if sig["funding_now"] is not None else "현재 펀딩비: N/A")
+        st.write(f"최근 5회 평균 펀딩비: {sig['funding_avg']:.4f}%" if sig["funding_avg"] is not None else "최근 5회 평균 펀딩비: N/A")
+        st.write(f"펀딩비 해석: {sig['funding_signal']}")
+        st.write(f"현재 OI: {sig['oi_now']:,.0f}" if sig["oi_now"] is not None else "현재 OI: N/A")
+        st.write(f"OI 변화율: {sig['oi_chg']:.2f}%" if sig["oi_chg"] is not None else "OI 변화율: N/A")
+        st.write(f"OI 해석: {sig['oi_signal']}")
+
+        st.divider()
         st.subheader("📍 지지/저항")
         st.markdown("**저항선**")
         for r in res_lvls:
@@ -205,12 +333,16 @@ try:
             st.write(f"🟢 ${s:,.0f}")
 
         st.divider()
-        st.subheader("💥 청산 클러스터")
-        for p, s in zip([sig["cp"]*r for r in [1.03,1.05,1.08]], [95,130,60]):
-            st.write(f"🟢 숏청산 ${p:,.0f} (~${s}M)")
-        for p, s in zip([sig["cp"]*r for r in [0.965,0.945,0.925]], [120,75,45]):
-            st.write(f"🔴 롱청산 ${p:,.0f} (~${s}M)")
+        st.subheader("🧮 TP / SL 계산기")
+        side = st.selectbox("방향", ["LONG", "SHORT"])
+        entry = st.number_input("진입가", value=float(sig["cp"]), step=100.0)
+        lev = st.slider("레버리지", 1, 50, 15)
+        sl_pct = st.number_input("손절 %", value=3.5, step=0.1)
+        tp_pct = st.number_input("익절 %", value=8.0, step=0.1)
+        sl, tp, liq = calc_tpsl(entry, side, lev, sl_pct, tp_pct)
+        st.write(f"손절가: ${sl:,.0f}")
+        st.write(f"익절가: ${tp:,.0f}")
+        st.write(f"청산가 추정: ${liq:,.0f}")
 
 except Exception as e:
     st.error(f"데이터 로딩 실패: {e}")
-    st.info("잠시 후 새로고침 버튼을 눌러주세요.")
